@@ -146,6 +146,59 @@ const settleChatGptUi = (): Promise<void> => (
   new Promise(resolveSettle => setTimeout(resolveSettle, CHATGPT_UI_SETTLE_MS))
 );
 
+export const CHATGPT_DOM_VIRTUALIZATION_KEEP_RECENT_TURNS = 8;
+const CHATGPT_DOM_VIRTUALIZATION_MARKER = "data-codex-dom-virtualized";
+
+/**
+ * Keep long retained ChatGPT conversations responsive without removing conversation content.
+ * Chromium can skip layout/paint work for old offscreen turns while recent turns remain fully
+ * active for streaming, tool calls, and completion detection.
+ */
+export async function installChatGptConversationDomVirtualization(page: Page): Promise<void> {
+  await page.evaluate(({ keepRecentTurns, marker }) => {
+    const stateKey = "__codexChatGptDomVirtualization";
+    const root = globalThis as typeof globalThis & Record<string, unknown>;
+    const existing = root[stateKey] as { refresh?: () => void } | undefined;
+    if (existing?.refresh) {
+      existing.refresh();
+      return;
+    }
+
+    const turnSelector = '[data-testid^="conversation-turn-"]';
+    let scheduled = false;
+    const refresh = () => {
+      scheduled = false;
+      const turns = Array.from(document.querySelectorAll<HTMLElement>(turnSelector));
+      const cutoff = Math.max(0, turns.length - keepRecentTurns);
+      turns.forEach((turn, index) => {
+        if (index < cutoff) {
+          turn.style.contentVisibility = "auto";
+          turn.style.containIntrinsicSize = "auto 600px";
+          turn.setAttribute(marker, "true");
+          return;
+        }
+        if (turn.getAttribute(marker) !== "true") return;
+        turn.style.removeProperty("content-visibility");
+        turn.style.removeProperty("contain-intrinsic-size");
+        turn.removeAttribute(marker);
+      });
+    };
+    const scheduleRefresh = () => {
+      if (scheduled) return;
+      scheduled = true;
+      requestAnimationFrame(refresh);
+    };
+
+    const observer = new MutationObserver(scheduleRefresh);
+    observer.observe(document.body, { childList: true, subtree: true });
+    root[stateKey] = { refresh };
+    refresh();
+  }, {
+    keepRecentTurns: CHATGPT_DOM_VIRTUALIZATION_KEEP_RECENT_TURNS,
+    marker: CHATGPT_DOM_VIRTUALIZATION_MARKER,
+  });
+}
+
 class ChatGptConnectorCatalogStaleError extends Error {
   constructor(
     readonly appName: string,
@@ -3082,6 +3135,7 @@ export class ChatGptBrowserWorker {
       });
       if (!maintenancePage && !launcherSurfaceId) managedPage = page;
       diagnosticPage = page;
+      await installChatGptConversationDomVirtualization(page);
       await diagnostics.capture(page, "browser-page-acquired");
       console.info(
         `[chatgpt-web] browser turn ${turn.traceId} opened (transport=${prepared.multipart ? `multipart-${prepared.multipart.parts.length}` : "inline"}, maxMessageChars=${maxMessageChars}, estimatedInputTokens=${estimatedInputTokens}, images=${prepared.images.length}, compactionTrimmedMessages=${prepared.trimmedCompactionMessages ?? 0})`,
